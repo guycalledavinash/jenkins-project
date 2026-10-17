@@ -27,7 +27,6 @@ pipeline {
   stages {
     stage('Checkout') {
       steps {
-        checkout scm
         sh '''
           if [ "$(id -u)" -eq 0 ]; then
             echo "The Docker Jenkins agent must run as a non-root user." >&2
@@ -38,6 +37,7 @@ pipeline {
             exit 1
           fi
         '''
+        checkout scm
       }
     }
     stage('Build and Test') {
@@ -72,6 +72,9 @@ pipeline {
           def imageRepository = params.DOCKER_IMAGE_REPOSITORY?.trim()
           if (!imageRepository || !(imageRepository ==~ /^[a-z0-9][a-z0-9._:\/-]*$/)) {
             error('Set DOCKER_IMAGE_REPOSITORY to a valid lowercase image repository without a tag.')
+          }
+          if (imageRepository.lastIndexOf(':') > imageRepository.lastIndexOf('/')) {
+            error('DOCKER_IMAGE_REPOSITORY must not include an image tag; the pipeline generates it per build.')
           }
           if (!env.BUILD_NUMBER || !env.GIT_COMMIT || env.GIT_COMMIT.length() < 12) {
             error('BUILD_NUMBER and GIT_COMMIT must be available after checkout to create a unique tag.')
@@ -175,8 +178,10 @@ if git diff --cached --quiet -- "$DEPLOY_MANIFEST_PATH"; then
   exit 0
 fi
 git -c user.name="$GIT_COMMIT_AUTHOR_NAME" -c user.email="$GIT_COMMIT_AUTHOR_EMAIL" commit -m "Update $DEPLOY_CONTAINER_NAME image to $DOCKER_IMAGE"
-git push origin "HEAD:refs/heads/$DEPLOY_BRANCH"
 '''
+              sshagent(credentials: ['deployment-repository-ssh']) {
+                sh 'git push origin "HEAD:refs/heads/$DEPLOY_BRANCH"'
+              }
             }
           }
         }
