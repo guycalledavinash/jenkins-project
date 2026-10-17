@@ -1,67 +1,56 @@
-# Spring Boot based Java web application
- 
-This is a simple Sprint Boot based Java application that can be built using Maven. Sprint Boot dependencies are handled using the pom.xml 
-at the root directory of the repository.
+# Spring Boot web application
 
-This is a MVC architecture based application where controller returns a page with title and message attributes to the view.
+This application can be built with Maven from this directory:
 
-## Execute the application locally and access it using your browser
-
-Checkout the repo and move to the directory
-
-```
-git clone https://github.com/iam-veeramalla/Jenkins-Zero-To-Hero/java-maven-sonar-argocd-helm-k8s/sprint-boot-app
-cd java-maven-sonar-argocd-helm-k8s/sprint-boot-app
+```sh
+mvn clean verify
 ```
 
-Execute the Maven targets to generate the artifacts
+The resulting JAR is written under `target/`. Build and run a local container with:
 
-```
-mvn clean package
-```
-
-The above maven target stroes the artifacts to the `target` directory. You can either execute the artifact on your local machine
-(or) run it as a Docker container.
-
-** Note: To avoid issues with local setup, Java versions and other dependencies, I would recommend the docker way. **
-
-
-### Execute locally (Java 11 needed) and access the application on http://localhost:8080
-
-```
-java -jar target/spring-boot-web.jar
+```sh
+docker build -t spring-boot-app:local .
+docker run --rm -p 8010:8080 spring-boot-app:local
 ```
 
-### The Docker way
+## Jenkins pipeline
 
-Build the Docker Image
+The `JenkinsFile` in this directory runs checkout, Maven build and tests, SonarQube analysis, Docker build/push, and an optional deployment manifest update. It updates a Git repository only; it does not deploy to a Kubernetes cluster.
 
-```
-docker build -t ultimate-cicd-pipeline:v1 .
-```
+### Jenkins prerequisites and credentials
 
-```
-docker run -d -p 8010:8080 -t ultimate-cicd-pipeline:v1
-```
+Configure these credentials in Jenkins Credentials Manager:
 
-Hurray !! Access the application on `http://<ip-address>:8010`
+- `sonarqube`: Secret text containing a SonarQube analysis token.
+- `docker-cred`: Username with password for the configured container registry. Used only when `PUBLISH_IMAGE=true`.
+- `deployment-repository-ssh`: SSH Username with private key, with write access to the chosen deployment repository branch. Used only when `UPDATE_DEPLOYMENT_MANIFEST=true`.
 
+The Jenkins agent image must include Java/Maven, Git, Docker CLI, and mikefarah `yq` v4. The Docker Pipeline, Git, and SSH Agent plugins must be installed. The agent must run as a non-root user and have read/write access to `/var/run/docker.sock`; the pipeline checks this before building. Docker socket access grants control of the host Docker daemon and is effectively host-level access, so use an isolated, dedicated Jenkins agent and never expose this socket to untrusted jobs.
 
-## Next Steps
+### Parameters
 
-### Configure a Sonar Server locally
+Set the following Jenkins build parameters for the services you want to run:
 
-```
-apt install unzip
-adduser sonarqube
-wget https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-9.4.0.54424.zip
-unzip *
-chmod -R 755 /home/sonarqube/sonarqube-9.4.0.54424
-chown -R sonarqube:sonarqube /home/sonarqube/sonarqube-9.4.0.54424
-cd sonarqube-9.4.0.54424/bin/linux-x86-64/
-./sonar.sh start
-```
+- `SONAR_HOST_URL`: your configured SonarQube URL. HTTPS is recommended when supported.
+- `DOCKER_IMAGE_REPOSITORY`: full image repository without a tag, such as `registry.example/team/app`.
+- `DOCKER_REGISTRY_URL`: HTTPS registry URL, required only when publishing.
+- `RUN_SONAR_ANALYSIS`: defaults to true. Set false for a local pipeline smoke test without SonarQube access.
+- `PUBLISH_IMAGE`: defaults to false. Enables registry login and image push.
+- `UPDATE_DEPLOYMENT_MANIFEST`: defaults to false. Requires `PUBLISH_IMAGE=true`.
+- `DEPLOY_REPOSITORY_URL`: SSH Git URL of the deployment repository.
+- `DEPLOY_BRANCH`: branch to update.
+- `DEPLOY_MANIFEST_PATH`: relative path to the Kubernetes deployment YAML; defaults to this repository's sample manifest path.
+- `DEPLOY_CONTAINER_NAME`: container to update; defaults to `spring-boot-app`.
+- `GIT_COMMIT_AUTHOR_NAME` and `GIT_COMMIT_AUTHOR_EMAIL`: identity recorded in the manifest commit.
 
-Hurray !! Now you can access the `SonarQube Server` on `http://<ip-address>:9000` 
+The image tag is generated from the Jenkins build number and the checked out commit's first 12 characters, so each build gets a traceable tag. The image repository is supplied separately; the pipeline does not assume a registry account or repository.
 
+### Manifest update behavior
 
+When enabled, the pipeline checks out the configured repository and branch using the SSH credential, verifies that exactly one container with the selected name exists, and confirms its image is either the `replaceImageTag` placeholder or already belongs to the configured image repository. It changes only that container's `image` field using `yq`, verifies the new value, stages only the specified manifest, and pushes the commit. Missing files, containers, image fields, invalid placeholders, or Git failures stop the build. If the manifest already has the desired image, it skips the commit and push and reports that no change was made.
+
+### Safe pipeline testing
+
+Run `mvn clean verify` locally to validate the application without contacting SonarQube, a registry, or a deployment repository.
+
+For a Jenkins smoke test, set `RUN_SONAR_ANALYSIS=false` and leave both `PUBLISH_IMAGE` and `UPDATE_DEPLOYMENT_MANIFEST` false. The pipeline will run Maven and build the image locally, but will not log into or push to a registry and will not check out or change a deployment repository. This still requires an isolated Jenkins agent with Docker socket access.

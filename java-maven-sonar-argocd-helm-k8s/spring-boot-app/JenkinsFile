@@ -2,67 +2,191 @@ pipeline {
   agent {
     docker {
       image 'abhishekf5/maven-abhishek-docker-agent:v1'
-      args '--user root -v /var/run/docker.sock:/var/run/docker.sock' // mount Docker socket to access the host's Docker daemon
+      // The agent must use a non-root user with Docker socket group access.
+      // Access to this socket grants control of the host Docker daemon.
+      args '-v /var/run/docker.sock:/var/run/docker.sock'
     }
+  }
+  options {
+    skipDefaultCheckout(true)
+  }
+  parameters {
+    string(name: 'SONAR_HOST_URL', defaultValue: '', description: 'Configured SonarQube URL (HTTP or HTTPS)')
+    string(name: 'DOCKER_IMAGE_REPOSITORY', defaultValue: '', description: 'Full image repository without a tag')
+    string(name: 'DOCKER_REGISTRY_URL', defaultValue: '', description: 'HTTPS registry URL; required when publishing')
+    booleanParam(name: 'RUN_SONAR_ANALYSIS', defaultValue: true, description: 'Run SonarQube analysis')
+    booleanParam(name: 'PUBLISH_IMAGE', defaultValue: false, description: 'Push the built image to the configured registry')
+    booleanParam(name: 'UPDATE_DEPLOYMENT_MANIFEST', defaultValue: false, description: 'Commit and push the manifest update')
+    string(name: 'DEPLOY_REPOSITORY_URL', defaultValue: '', description: 'SSH URL of the deployment repository')
+    string(name: 'DEPLOY_BRANCH', defaultValue: '', description: 'Branch in the deployment repository')
+    string(name: 'DEPLOY_MANIFEST_PATH', defaultValue: 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml', description: 'Manifest path relative to the deployment repository root')
+    string(name: 'DEPLOY_CONTAINER_NAME', defaultValue: 'spring-boot-app', description: 'Container whose image field is updated')
+    string(name: 'GIT_COMMIT_AUTHOR_NAME', defaultValue: '', description: 'Name recorded on the manifest commit')
+    string(name: 'GIT_COMMIT_AUTHOR_EMAIL', defaultValue: '', description: 'Email recorded on the manifest commit')
   }
   stages {
     stage('Checkout') {
       steps {
-        sh 'echo passed'
-        //git branch: 'main', url: 'https://github.com/iam-veeramalla/Jenkins-Zero-To-Hero.git'
+        sh '''
+          if [ "$(id -u)" -eq 0 ]; then
+            echo "The Docker Jenkins agent must run as a non-root user." >&2
+            exit 1
+          fi
+          if [ ! -S /var/run/docker.sock ] || [ ! -r /var/run/docker.sock ] || [ ! -w /var/run/docker.sock ]; then
+            echo "The non-root Jenkins agent user needs read/write access to the mounted Docker socket." >&2
+            exit 1
+          fi
+        '''
+        checkout scm
       }
     }
     stage('Build and Test') {
       steps {
-        sh 'ls -ltr'
-        // build the project and create a JAR file
-        sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn clean package'
+        sh 'mvn -f java-maven-sonar-argocd-helm-k8s/spring-boot-app/pom.xml clean verify'
       }
     }
     stage('Static Code Analysis') {
-      environment {
-        SONAR_URL = "http://34.201.116.83:9000"
+      when {
+        expression { params.RUN_SONAR_ANALYSIS }
       }
       steps {
-        withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_AUTH_TOKEN')]) {
-          sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn sonar:sonar -Dsonar.login=$SONAR_AUTH_TOKEN -Dsonar.host.url=${SONAR_URL}'
+        script {
+          def sonarUrl = params.SONAR_HOST_URL?.trim()
+          if (!sonarUrl || !(sonarUrl ==~ /^https?:\/\/[^\s]+$/)) {
+            error('Set SONAR_HOST_URL to the configured SonarQube HTTP(S) URL.')
+          }
+          withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_TOKEN')]) {
+            withEnv(["SONAR_HOST_URL=${sonarUrl}"]) {
+              dir('java-maven-sonar-argocd-helm-k8s/spring-boot-app') {
+                // SonarScanner reads SONAR_TOKEN from the environment.
+                sh 'mvn sonar:sonar -Dsonar.host.url="$SONAR_HOST_URL"'
+              }
+            }
+          }
         }
       }
     }
     stage('Build and Push Docker Image') {
-      environment {
-        DOCKER_IMAGE = "abhishekf5/ultimate-cicd:${BUILD_NUMBER}"
-        // DOCKERFILE_LOCATION = "java-maven-sonar-argocd-helm-k8s/spring-boot-app/Dockerfile"
-        REGISTRY_CREDENTIALS = credentials('docker-cred')
-      }
       steps {
         script {
-            sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && docker build -t ${DOCKER_IMAGE} .'
-            def dockerImage = docker.image("${DOCKER_IMAGE}")
-            docker.withRegistry('https://index.docker.io/v1/', "docker-cred") {
-                dockerImage.push()
+          def imageRepository = params.DOCKER_IMAGE_REPOSITORY?.trim()
+          if (!imageRepository || !(imageRepository ==~ /^[a-z0-9][a-z0-9._:\/-]*$/)) {
+            error('Set DOCKER_IMAGE_REPOSITORY to a valid lowercase image repository without a tag.')
+          }
+          if (imageRepository.lastIndexOf(':') > imageRepository.lastIndexOf('/')) {
+            error('DOCKER_IMAGE_REPOSITORY must not include an image tag; the pipeline generates it per build.')
+          }
+          if (!env.BUILD_NUMBER || !env.GIT_COMMIT || env.GIT_COMMIT.length() < 12) {
+            error('BUILD_NUMBER and GIT_COMMIT must be available after checkout to create a unique tag.')
+          }
+          if ((params.PUBLISH_IMAGE || params.UPDATE_DEPLOYMENT_MANIFEST) && !params.RUN_SONAR_ANALYSIS) {
+            error('Publishing or updating a manifest requires RUN_SONAR_ANALYSIS=true.')
+          }
+          def imageTag = "${env.BUILD_NUMBER}-${env.GIT_COMMIT.take(12)}"
+          env.DOCKER_IMAGE = "${imageRepository}:${imageTag}"
+          sh 'docker build -t "$DOCKER_IMAGE" java-maven-sonar-argocd-helm-k8s/spring-boot-app'
+          if (params.PUBLISH_IMAGE) {
+            def registryUrl = params.DOCKER_REGISTRY_URL?.trim()
+            if (!registryUrl || !(registryUrl ==~ /^https:\/\/[^\s]+$/)) {
+              error('Set DOCKER_REGISTRY_URL to the HTTPS registry URL before enabling PUBLISH_IMAGE.')
             }
+            docker.withRegistry(registryUrl, 'docker-cred') {
+              docker.image(env.DOCKER_IMAGE).push()
+            }
+          } else {
+            echo "Built ${env.DOCKER_IMAGE} locally; PUBLISH_IMAGE is disabled."
+          }
         }
       }
     }
     stage('Update Deployment File') {
-        environment {
-            GIT_REPO_NAME = "Jenkins-Zero-To-Hero"
-            GIT_USER_NAME = "iam-veeramalla"
-        }
-        steps {
-            withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
-                sh '''
-                    git config user.email "abhishek.xyz@gmail.com"
-                    git config user.name "Abhishek Veeramalla"
-                    BUILD_NUMBER=${BUILD_NUMBER}
-                    sed -i "s/replaceImageTag/${BUILD_NUMBER}/g" java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
-                    git add java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml
-                    git commit -m "Update deployment image to version ${BUILD_NUMBER}"
-                    git push https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME} HEAD:main
-                '''
+      when {
+        expression { params.UPDATE_DEPLOYMENT_MANIFEST }
+      }
+      steps {
+        script {
+          if (!params.PUBLISH_IMAGE) {
+            error('Set PUBLISH_IMAGE=true before UPDATE_DEPLOYMENT_MANIFEST=true.')
+          }
+          def repositoryUrl = params.DEPLOY_REPOSITORY_URL?.trim()
+          if (!repositoryUrl || !(repositoryUrl ==~ /^(git@[^\s:]+:.+|ssh:\/\/[^\s]+)$/)) {
+            error('Set DEPLOY_REPOSITORY_URL to an SSH Git URL; deployment-repository-ssh must be an SSH key.')
+          }
+          def branch = params.DEPLOY_BRANCH?.trim()
+          if (!branch || !(branch ==~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/) || branch.contains('..')) {
+            error('Set DEPLOY_BRANCH to a valid branch name.')
+          }
+          def manifestPath = params.DEPLOY_MANIFEST_PATH?.trim()
+          if (!manifestPath || manifestPath.startsWith('/') || manifestPath.split('/').contains('..') || !(manifestPath ==~ /^[A-Za-z0-9._\/-]+$/)) {
+            error('DEPLOY_MANIFEST_PATH must be a relative path inside the deployment repository.')
+          }
+          def containerName = params.DEPLOY_CONTAINER_NAME?.trim()
+          def authorName = params.GIT_COMMIT_AUTHOR_NAME?.trim()
+          def authorEmail = params.GIT_COMMIT_AUTHOR_EMAIL?.trim()
+          if (!containerName || !authorName || !authorEmail || authorName.contains('\n') || authorEmail.contains('\n')) {
+            error('Set DEPLOY_CONTAINER_NAME, GIT_COMMIT_AUTHOR_NAME, and GIT_COMMIT_AUTHOR_EMAIL.')
+          }
+          dir('deployment-manifests') {
+            deleteDir()
+            checkout([
+              $class: 'GitSCM',
+              branches: [[name: "*/${branch}"]],
+              userRemoteConfigs: [[url: repositoryUrl, credentialsId: 'deployment-repository-ssh']]
+            ])
+            withEnv([
+              "DEPLOY_BRANCH=${branch}",
+              "DEPLOY_MANIFEST_PATH=${manifestPath}",
+              "DEPLOY_CONTAINER_NAME=${containerName}",
+              "DOCKER_IMAGE_REPOSITORY=${params.DOCKER_IMAGE_REPOSITORY.trim()}",
+              "DOCKER_IMAGE=${env.DOCKER_IMAGE}",
+              "GIT_COMMIT_AUTHOR_NAME=${authorName}",
+              "GIT_COMMIT_AUTHOR_EMAIL=${authorEmail}",
+              'GIT_TERMINAL_PROMPT=0'
+            ]) {
+              sh '''#!/bin/sh
+set -eu
+if ! command -v yq >/dev/null 2>&1 || ! yq --version | grep -Eq 'version v?4\.'; then
+  echo "Required tool mikefarah yq v4 is missing from the Jenkins agent." >&2
+  exit 1
+fi
+if [ ! -f "$DEPLOY_MANIFEST_PATH" ]; then
+  echo "Deployment manifest not found: $DEPLOY_MANIFEST_PATH" >&2
+  exit 1
+fi
+CONTAINER_COUNT="$(yq -r '[.spec.template.spec.containers[] | select(.name == strenv(DEPLOY_CONTAINER_NAME))] | length' "$DEPLOY_MANIFEST_PATH")"
+if [ "$CONTAINER_COUNT" != "1" ]; then
+  echo "Expected exactly one container named $DEPLOY_CONTAINER_NAME; found $CONTAINER_COUNT." >&2
+  exit 1
+fi
+CURRENT_IMAGE="$(yq -er '.spec.template.spec.containers[] | select(.name == strenv(DEPLOY_CONTAINER_NAME)) | .image' "$DEPLOY_MANIFEST_PATH")"
+case "$CURRENT_IMAGE" in
+  *:replaceImageTag|"$DOCKER_IMAGE_REPOSITORY:"*) ;;
+  *)
+    echo "Target image is not the expected placeholder or configured repository: $CURRENT_IMAGE" >&2
+    exit 1
+    ;;
+esac
+yq -i '(.spec.template.spec.containers[] | select(.name == strenv(DEPLOY_CONTAINER_NAME)) | .image) = strenv(DOCKER_IMAGE)' "$DEPLOY_MANIFEST_PATH"
+UPDATED_IMAGE="$(yq -er '.spec.template.spec.containers[] | select(.name == strenv(DEPLOY_CONTAINER_NAME)) | .image' "$DEPLOY_MANIFEST_PATH")"
+if [ "$UPDATED_IMAGE" != "$DOCKER_IMAGE" ]; then
+  echo "Manifest image update verification failed." >&2
+  exit 1
+fi
+git add -- "$DEPLOY_MANIFEST_PATH"
+if git diff --cached --quiet -- "$DEPLOY_MANIFEST_PATH"; then
+  echo "No manifest changes; skipping commit and push."
+  exit 0
+fi
+git -c user.name="$GIT_COMMIT_AUTHOR_NAME" -c user.email="$GIT_COMMIT_AUTHOR_EMAIL" commit -m "Update $DEPLOY_CONTAINER_NAME image to $DOCKER_IMAGE"
+'''
+              sshagent(credentials: ['deployment-repository-ssh']) {
+                sh 'git push origin "HEAD:refs/heads/$DEPLOY_BRANCH"'
+              }
             }
+          }
         }
+      }
     }
   }
 }
+
