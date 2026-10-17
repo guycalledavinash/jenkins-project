@@ -160,7 +160,7 @@ if [ "$CONTAINER_COUNT" != "1" ]; then
 fi
 CURRENT_IMAGE="$(yq -er '.spec.template.spec.containers[] | select(.name == strenv(DEPLOY_CONTAINER_NAME)) | .image' "$DEPLOY_MANIFEST_PATH")"
 case "$CURRENT_IMAGE" in
-  "$DOCKER_IMAGE_REPOSITORY:replaceImageTag"|"$DOCKER_IMAGE_REPOSITORY:"*) ;;
+  *:replaceImageTag|"$DOCKER_IMAGE_REPOSITORY:"*) ;;
   *)
     echo "Target image is not the expected placeholder or configured repository: $CURRENT_IMAGE" >&2
     exit 1
