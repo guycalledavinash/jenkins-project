@@ -25,7 +25,7 @@ Configure these credentials in Jenkins Credentials Manager:
 - `docker-cred`: Username with password for the configured container registry. Used only when `PUBLISH_IMAGE=true`.
 - `deployment-repository-ssh`: SSH Username with private key, with write access to the chosen deployment repository branch. Used only when `UPDATE_DEPLOYMENT_MANIFEST=true`.
 
-The Jenkins agent image must include Java/Maven, Git, Docker CLI, and mikefarah `yq` v4. The Docker Pipeline and Git plugins must be installed. The agent must run as a non-root user and have read/write access to `/var/run/docker.sock`; the pipeline checks this before building. Docker socket access grants control of the host Docker daemon and is effectively host-level access, so use an isolated, dedicated Jenkins agent and never expose this socket to untrusted jobs.
+The Jenkins agent image must include Java/Maven, Git, Docker CLI, and mikefarah `yq` v4. The Docker Pipeline, Git, and SSH Agent plugins must be installed. The agent must run as a non-root user and have read/write access to `/var/run/docker.sock`; the pipeline checks this before building. Docker socket access grants control of the host Docker daemon and is effectively host-level access, so use an isolated, dedicated Jenkins agent and never expose this socket to untrusted jobs.
 
 ### Parameters
 
